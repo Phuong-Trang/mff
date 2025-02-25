@@ -9,15 +9,15 @@ from sktime.forecasting.base import BaseForecaster
 
 from mff.utils import (
     CheckTrainingSampleSize,
-    DefaultForecaster,
-    OrganizeCells,
+    DefaultForecaster,                   
+    OrganizeCells,                      
     StringToMatrixConstraints,
-    AddIslandsToConstraints,
-    FillAllEmptyCells,
+    AddIslandsToConstraints,           
+    FillAllEmptyCells,                  
     GenPredTrueData,
     BreakDataFrameIntoTimeSeriesList,
     GenVecForecastWithIslands,
-    GenWeightMatrix,
+    GenWeightMatrix,                     
     GenLamstar,
     GenSmoothingMatrix,
     Reconciliation,
@@ -127,8 +127,12 @@ class MFF:
         max_lam = self.max_lam
         
         # modify inputs into machine-friendly shape
-        df0, all_cells, unknown_cells, known_cells, islands = OrganizeCells(df)
+        """ Data processing
+            - Converts the dataset into a structured format (OrganizeCells).
+            - Checks for enough training data (CheckTrainingSampleSize).
+        """
 
+        df0, all_cells, unknown_cells, known_cells, islands = OrganizeCells(df)
         small_sample: bool = CheckTrainingSampleSize(df0,n_forecast_error)
 
         # Initiate DefaultForecaster only if a forecaster has not already been 
@@ -138,6 +142,10 @@ class MFF:
 
              forecaster = DefaultForecaster(small_sample)
 
+        """ Constraint Handling
+            - Converts constraints into matrix form (StringToMatrixConstraints).
+            - Incorporates island values (AddIslandsToConstraints).
+        """
         C,d = StringToMatrixConstraints(df0.T.stack(),
                                         all_cells,
                                         unknown_cells,
@@ -150,9 +158,16 @@ class MFF:
                                                   known_cells,
                                                   inequality_constraints)
         # 1st stage forecast and its model
+        """ First-Stage Forecasting
+            - Fills missing values with best-fit ML models (FillAllEmptyCells).
+        """
         df1,df1_model = FillAllEmptyCells(df0,forecaster,parallelize=parallelize)
 
         # get pseudo out-of-sample prediction, true values, and prediction models
+        """ Historical Forecast Evaluation
+            - Generates pseudo-out-of-sample predictions (GenPredTrueData).
+            - Computes forecast reliability (GenWeightMatrix).
+        """
         pred,true,model = GenPredTrueData(df0,forecaster,n_forecast_error=n_forecast_error, 
                                           parallelize=parallelize)
         
@@ -169,6 +184,9 @@ class MFF:
         Phi = GenSmoothingMatrix(W,smoothness)
 
         # 2nd stage forecast
+        """Final Reconciliation
+            - Ensures constraints hold using Reconciliation.
+        """
         y2 = Reconciliation(y1,W,Phi,C,d,C_ineq,d_ineq)
         
         # reshape vector y2 into df2

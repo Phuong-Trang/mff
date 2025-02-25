@@ -107,6 +107,12 @@ def DefaultForecaster(small_sample:bool = False)->BaseForecaster:
 
     """
     
+    """
+    Creates a forecast pipeline:
+        Standardizes the data.
+        Uses ElasticNetCV (a regularized regression model).
+        TimeSeriesSplit (5-fold cross-validation) is used for hyperparameter tuning.
+    """
     pipe_y_elasticnet = TransformedTargetForecaster(steps=[
         ('scaler', TabularToSeriesAdaptor(StandardScaler())),
         ('forecaster',DirectReductionForecaster(
@@ -114,22 +120,32 @@ def DefaultForecaster(small_sample:bool = False)->BaseForecaster:
                          cv = TimeSeriesSplit(n_splits=5)))),
         ])
     
+    # Wraps pipe_y_elasticnet inside another pipeline.
     pipe_yX_elasticnet = ForecastingPipeline(steps=[
         ('scaler', TabularToSeriesAdaptor(StandardScaler())),
         ('pipe_y', pipe_y_elasticnet),
         ])
 
+    # Creates a simple OLS model using only one feature.
     ols_1feature = ForecastingPipeline(steps=[
         ('feature_selection',FeatureSelection(n_columns=1)),
         ('ols',DirectReductionForecaster(LinearRegression()))
         ])
     
+    # Uses PCA (Principal Component Analysis) for dimensionality reduction.
+    # Keeps 90% variance of the data.
     ols_pca = ForecastingPipeline(steps=[
         ('pca',TabularToSeriesAdaptor(PCA(n_components=.9))),
         ('ols',DirectReductionForecaster(LinearRegression()))
         ])
         
     # forecaster representation for selection among the listed models
+    """
+    Creates a model selection system that can switch between:
+        Naive forecasts (last value, mean, drift).
+        ElasticNet regression.
+        OLS with PCA.
+    """
     forecaster = MultiplexForecaster(
         forecasters=[
             ('naive_drift', NaiveForecaster(strategy='drift',window_length=2)),
@@ -141,10 +157,16 @@ def DefaultForecaster(small_sample:bool = False)->BaseForecaster:
         ]
     )
 
+    # Expanding window cross-validation.
     cv = ExpandingGreedySplitter(test_size=1, folds=5)
 
     # If the number of observations is small, Grid Search is no longer used for
     # model selection. Instead, OLS with PCA is used is used.
+
+    """
+    If dataset is large, it uses GridSearchCV to pick the best model.
+    If small, it defaults to PCA regression.
+    """
     
     if not small_sample:
 
@@ -252,7 +274,7 @@ def OrganizeCells(df:pd.DataFrame):
         islands = df[df_no_islands.isna()].T.stack()
         return df_no_islands, islands
     
-    # clean islands
+    # clean islands (known but isolated valuesvalues)
     df0, islands = CleanIslands(df)
 
     # all cells in forecast horizon
@@ -334,7 +356,11 @@ def StringToMatrixConstraints(df0_stacked:pd.DataFrame, # stack df0 to accomodat
     >>>                                 constraints_with_wildcard)  
     """
     def find_permissible_wildcard(constraints_with_wildcard):
-        """Generate random letter to be used in constraints."""
+        """Generate random letter to be used in constraints.
+        - Finds a unique replacement for the wildcard (?) to avoid conflicts with existing variable names.
+        - Generates a random lowercase letter (e.g., x).
+        - Ensures that the letter does not exist in the constraint equations.
+        """
         wild_card_length = 1
         candidate = ''.join(random.sample(ascii_lowercase,wild_card_length))
         while candidate in ''.join(constraints_with_wildcard):
@@ -404,6 +430,8 @@ def StringToMatrixConstraints(df0_stacked:pd.DataFrame, # stack df0 to accomodat
             Expanded list of constraints over all time periods.
 
         Examples
+        Input: GDP? + C? = I?
+        Output: GDP2023 + C2023 = I2023, GDP2024 + C2024 = I2024, ...
         --------
         >>> import numpy as np
         >>> import pandas as pd
@@ -444,16 +472,21 @@ def StringToMatrixConstraints(df0_stacked:pd.DataFrame, # stack df0 to accomodat
                                   wildcard = alphabet_wildcard)
     
     # obtain C_unknown by differentiating constraints wrt unknown cells with nan 
+    """
+    Uses SymPy (sp) to convert constraints into a system of linear equations (Cy = d).
+        - A represents the constraint coefficients (C).
+        - b represents the constraint values (d).
+    """
     A, b = sp.linear_eq_to_matrix(constraints, sp.sympify(unknown_cells.tolist()))
     C = pd.DataFrame(np.array(A).astype(float),
                      index = constraints,
                      columns = unknown_cells.index)
     nonzero_rows = (C != 0).any(axis=1)
-    C = C.loc[nonzero_rows] # drop rows with all zeros
+    C = C.loc[nonzero_rows] # Removes rows where all coefficients are zero (no meaningful constraints).
     
     # obtain d_unknown by substituting known cells
     known_cell_dict = pd.Series([df0_stacked.loc[idx] for idx in known_cells.index],
-                                index = known_cells.tolist()).to_dict()
+                                index = known_cells.tolist()).to_dict() # Maps known variables to their actual values.
     d = pd.DataFrame(np.array(b.subs(known_cell_dict)).astype(float),
                              index = constraints)
     d = d.loc[nonzero_rows] # drop rows with all zeros in C
@@ -523,6 +556,7 @@ def AddIslandsToConstraints(C:pd.DataFrame,
 
 def FillAnEmptyCell(df,row,col,forecaster):
     """
+    Purpose: Generates a forecast for a single missing cell.
     Generate a forecast for a given cell based on the latest known value 
     for the given column (variable) and using the predefined forecasting pipeline.
     Called by ``FillAllEmptyCells``.
@@ -932,10 +966,27 @@ def GenWeightMatrix(pred_list,true_list,shrinkage_method='oas'):
     n_vars = fe.shape[1]
     sample_cov = fe.cov()
     
+    """
+    Effect: Treats all forecast errors equally.
+    Best for: When no historical forecast error information is available.
+    Ex: 
+    1 0 0 
+    0 1 0
+    0 0 1
+    """
     if shrinkage_method == 'identity':
         W = pd.DataFrame(np.eye(sample_cov.shape[0]),index=sample_cov.index,columns=sample_cov.columns)
         return W, np.nan
     
+    """
+    OAS (Oracle Approximation Shrinkage) to estimate the covariance matrix of forecast errors.
+    Effect: Balances between empirical covariance (high variance) and identity matrix (I) (low variance).
+    Best for: When you have limited historical forecast data but still want to capture correlations.
+    Ex: Preserves some correlation structure while shrinking extreme values.
+    0.9 0.2 0.1
+    0.2 1.1 0.3
+    0.1 0.3 0.8
+    """
     if shrinkage_method == 'oas':    
         from sklearn.covariance import OAS
         oas = OAS().fit(fe.values)
@@ -943,6 +994,11 @@ def GenWeightMatrix(pred_list,true_list,shrinkage_method='oas'):
         rho = oas.shrinkage_
         return W, rho
     
+    """
+    (OAS with Diagonal Modification) similar to oas, but with an additional diagonal adjustment.
+    Effect: Enhances stability by giving more weight to individual forecast variances.
+    Best for: When you trust individual forecasts more than correlations.
+    """
     if shrinkage_method == 'oasd':
         if n_vars>=2:
             # shrinkage target
@@ -961,6 +1017,15 @@ def GenWeightMatrix(pred_list,true_list,shrinkage_method='oas'):
             rho = np.nan
         return W, rho
     
+    """
+    Constructs a diagonal covariance matrix, where weights gradually decrease.
+    Effect: Assigns higher weight to more recent forecasts.
+    Best for: Time-series forecasting, where recent errors are more relevant.
+    Ex: Weights decrease over time, assuming more recent data is more reliable
+    1.0 0.0 0.0 
+    0.0 0.8 0.0
+    0.0 0.00 0.6
+    """
     if shrinkage_method == 'monotone diagonal':
         if n_vars>=2:
             diag = pd.Series(np.diag(sample_cov),
@@ -1058,6 +1123,7 @@ def GenLamstar(pred_list: list,
 
 def GenSmoothingMatrix(W,lamstar):
     """
+    Purpose: Applies smoothing to prevent excessive fluctuations in forecasts.
     Generate symmetric smoothing matrix using optimal lambda and weighting matrix.
 
     Parameters
@@ -1093,7 +1159,7 @@ def GenSmoothingMatrix(W,lamstar):
                    for tsidx in lamstar.index]
     Phi_np = block_diag(*[lam.iloc[tsidxi] * HP_matrix(len(tsidx)) 
                        for tsidxi,tsidx in enumerate(lam.index)])
-    Phi = pd.DataFrame(Phi_np,index=W.index,columns=W.columns)
+    Phi = pd.DataFrame(Phi_np,index=W.index,columns=W.columns) # used in the reconciliation step.
     return Phi
     
 
@@ -1156,11 +1222,13 @@ def Reconciliation(y1,W,Phi,C,d,C_ineq=None,d_ineq=None):
     >>> y2 = Reconciliation(m.y1,m.W,m.Phi,m.C,m.d)
 
     """
+    # Validate Input Dimensions
     assert((y1.index == W.index).all())
     assert((y1.index == Phi.index).all())
     assert((y1.index == C.columns).all())
     assert((C.index  == d.index).all())
     
+    # Removes redundant (linearly dependent) constraints to avoid numerical issues.
     def DropLinDepRows(C_aug,d_aug):
         
         C = C_aug.values
@@ -1198,9 +1266,32 @@ def Reconciliation(y1,W,Phi,C,d,C_ineq=None,d_ineq=None):
     
     In = np.eye(len(y1))
     y1n = y1.values.reshape(-1,1)
+    """
+    y1n (r^u_t): First-stage forecast
+    y2n (r~u_t): Final reconciled forecast
+    In: Identity matrix of the same size as y1n 
+    W_inv (W^): Inverse of the weight matrix (prioritizes reliable forecasts).
+    Phi: Smoothing matrix (prevents sharp jumps in adjustments).
+    denom: Combines forecast weight and smoothness control.
+    Cn: Equality constraint matrix (Cn.T = U_t)
+    CdC_inv (U'_t*W^*U_tt): Inverse of the constraint transformation (ensures constraints hold).
+    dn: Right-hand side of constraints (known values).
+    """
+    """
+    Applies weight correction
+    Applies smoothing
+    Ensures adjustments respect the constraints.
+    Projects the corrected forecast (y1n) onto the valid constraint space.
+    """
     y2n = ( In - denom @ Cn.T @ CdC_inv @ Cn ) @ denom @ W_inv @ y1n + \
         denom @ Cn.T @ CdC_inv @ dn
+    """
+    Adjusts dn using the inverse transformation of constraints.
+    Ensures that the final forecast (y2n) exactly satisfies the constraints.
+    Ensures smooth integration of constraints.
+    """
     
+    # The same with inequality constraint but our country example doesn't have 
     if C_ineq is not None and C_ineq.shape[0]>0:
         
         C_ineq,d_ineq = DropLinDepRows(C_ineq,d_ineq)
